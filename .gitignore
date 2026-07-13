@@ -1,5 +1,6 @@
 node_modules/
+projects/
 dist/
-src/
+tsconfig.json
 *.tsbuildinfo
-probe.log
+*.log

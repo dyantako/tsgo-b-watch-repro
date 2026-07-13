@@ -1,35 +1,53 @@
-// Generates a project that imports N trivial node_modules packages.
-// The bug is a function of how many resolved modules the program watches, so
-// the repro just needs enough distinct node_modules imports to cross the limit.
+// Generates a `tsc -b` solution that reproduces the slow computeDesiredWatches
+// stall: N composite projects, each importing K shared node_modules packages.
 //
-//   node setup.mjs 600   -> over the limit, `tsc -b --watch` goes deaf
-//   node setup.mjs 400   -> under the limit, watch works
+// The bug scales with (total input+buildinfo files) x (number of desired watch
+// dirs), so it needs a multi-project solution with many resolved modules to
+// show up. Defaults (N=15, K=1500) put computeDesiredWatches at ~85s on an M-series
+// Mac; a single small project returns in milliseconds and hides the bug.
+//
+//   node setup.mjs          # N=15 K=1500
+//   node setup.mjs 15 1500
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const count = Number(process.argv[2] ?? 600);
+const N = Number(process.argv[2] ?? 15);
+const K = Number(process.argv[3] ?? 1500);
 
-const scope = path.join(root, "node_modules");
-for (const e of fs.readdirSync(scope)) {
-  if (/^dep\d+$/.test(e)) fs.rmSync(path.join(scope, e), { recursive: true, force: true });
+const nm = path.join(root, "node_modules");
+for (const e of fs.readdirSync(nm)) {
+  if (/^dep\d+$/.test(e)) fs.rmSync(path.join(nm, e), { recursive: true, force: true });
 }
-fs.rmSync(path.join(root, "src"), { recursive: true, force: true });
-fs.mkdirSync(path.join(root, "src"), { recursive: true });
+fs.rmSync(path.join(root, "projects"), { recursive: true, force: true });
 
+// K shared node_modules packages (each a package.json + a .d.ts).
 let imports = "";
 const names = [];
-for (let i = 0; i < count; i++) {
-  const dir = path.join(scope, "dep" + i);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "package.json"),
+for (let i = 0; i < K; i++) {
+  const d = path.join(nm, "dep" + i);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, "package.json"),
     JSON.stringify({ name: "dep" + i, version: "1.0.0", types: "index.d.ts" }));
-  fs.writeFileSync(path.join(dir, "index.d.ts"), `export declare const d${i}: number;\n`);
+  fs.writeFileSync(path.join(d, "index.d.ts"), `export declare const d${i}: number;\n`);
   imports += `import { d${i} } from "dep${i}";\n`;
   names.push("d" + i);
 }
-fs.writeFileSync(path.join(root, "src", "index.ts"),
-  imports + `export const marker: number = 1;\nexport const sum = ${names.join(" + ") || "0"};\n`);
+const body = imports + `export const sum = ${names.join(" + ") || "0"};\n`;
 
-console.log(`Generated src/index.ts importing ${count} node_modules packages.`);
+// N composite projects, each importing all K packages.
+const references = [];
+for (let p = 0; p < N; p++) {
+  const dir = path.join(root, "projects", "p" + p);
+  fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "src", "index.ts"), `export const marker${p}: number = 1;\n` + body);
+  fs.writeFileSync(path.join(dir, "tsconfig.json"), JSON.stringify({
+    compilerOptions: { composite: true, outDir: "dist", rootDir: "src", moduleResolution: "bundler", module: "esnext" },
+    include: ["src/**/*.ts"],
+  }, null, 2));
+  references.push({ path: `./projects/p${p}` });
+}
+fs.writeFileSync(path.join(root, "tsconfig.json"), JSON.stringify({ files: [], references }, null, 2));
+
+console.log(`Generated a solution: ${N} projects x ${K} shared node_modules packages.`);

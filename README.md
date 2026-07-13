@@ -1,101 +1,102 @@
-# `tsc -b --watch` stops detecting file changes past ~500 watched modules (native compiler)
+# `tsc -b --watch` misses file changes on large solutions (native compiler)
 
-The native compiler's **build/solution watch mode** (`tsc -b --watch`, i.e. `tsgo -b --watch`)
-silently stops delivering file-change events once the program watches more than roughly
-**500 resolved `node_modules` modules**. The initial build completes, prints
-`Watching for file changes.`, and then never reacts to any edit. No error, no rebuild.
+On a large project-references solution, the native compiler's build/solution watch
+(`tsc -b --watch`, i.e. `tsgo -b --watch`) prints `Watching for file changes.` almost
+immediately but then does not react to edits for a long time (tens of seconds to
+minutes). During that window every change is silently dropped. Plain `tsc --watch`
+(single project) is unaffected.
 
-Plain `tsc --watch` (non-build mode) on the same project is unaffected.
+Root cause: `computeDesiredWatches` in `internal/execute/build/orchestrator.go` is
+O(files × dirs) and takes ~85s on the solution generated below (and ~74s on a real
+30-project monorepo subgraph) before any filesystem watch is registered.
 
 ## Environment
 
-- `typescript@7.0.2` (also reproduces on `typescript@next`, `7.1.0-dev.20260712.1`)
-- macOS 26.5 (arm64), Node v24
-- `tsc` here is the native compiler: the `tsc` bin in `typescript@7` execs the platform
-  `tsgo` binary, so `tsc -b --watch` and `tsgo -b --watch` run identical code.
+- `typescript@7.0.2` (also reproduces on the `7.1.0-dev` nightly)
+- macOS (arm64), Node 24. The `tsc` bin execs the platform `tsgo` binary, so
+  `tsc -b --watch` and `tsgo -b --watch` are the same native code.
 
 ## Reproduce
 
 ```sh
 npm install
-npm run setup        # generates src/index.ts importing 600 node_modules packages
-npm run watch        # tsc -b --watch --preserveWatchOutput
+npm run setup      # generates 15 projects x 1500 shared node_modules packages
+npm run watch      # tsc -b --watch --preserveWatchOutput
 ```
 
-Wait for `Watching for file changes.`, then in another terminal introduce a type error:
+You will see `Found 0 errors. Watching for file changes.` within a couple of seconds,
+but the process then pegs a CPU core for ~85s inside `computeDesiredWatches` before any
+watch exists. An edit made during that window is lost:
 
 ```sh
-printf 'export const marker: number = "boom";\n' >> src/index.ts
+# a few seconds after "Watching for file changes" prints:
+printf 'export const marker0: number = "boom";\n' >> projects/p0/src/index.ts
 ```
 
-**Expected:** watch reports `File change detected` and a `TS2322` error.
-**Actual:** nothing. The watcher never fires again for any change.
-
-## It's a threshold, and it's `-b`-specific
-
-`setup.mjs` takes the module count as an argument. Editing `src/index.ts` after the
-watcher is armed:
-
-| Command | Modules imported | File change detected? |
-| --- | --- | --- |
-| `tsc -b --watch` | 400 | yes |
-| `tsc -b --watch` | 500 | yes |
-| `tsc -b --watch` | 600 | **no** |
-| `tsc -b --watch` | 1000 | **no** |
-| `tsc --watch` (no `-b`) | 1000 | yes |
-| `tsc --watch` (no `-b`) | 3000 | yes |
-
-So:
-
-- The cliff sits between 500 and 600 watched modules (≈512).
-- It is specific to build/solution mode (`-b`). Plain `--watch` watches 3000+ modules fine.
-- It is driven by module-resolution watches, not raw file count: a single-project
-  `--watch` over 3000 local files/directories works; ~600 `node_modules` imports does not.
-
-## Why it matters
-
-In a real pnpm monorepo (~two dozen project references, thousands of resolved modules)
-`tsc -b --watch` never picks up any edit, which makes the standard "watch the whole
-solution" type-check loop unusable on the native compiler. Plain `tsc --watch` per
-project, or the previous JS-based `tsc` (`typescript@6.x`) `-b --watch`, both work.
+Expected: `File change detected` + a `TS2322` error. Actual: nothing, because no watch
+is registered yet. (A single small project returns from `computeDesiredWatches` in
+milliseconds and works fine, which is why the bug only shows at solution scale.)
 
 ## Root cause
 
-`internal/fswatch/fsevents_darwin.go` (macOS only, which is why this is Darwin-specific).
+`internal/execute/build/orchestrator.go`, `computeDesiredWatches()`.
 
-`startFSEventsStreams` tries to watch every directory in a single FSEvents stream and
-only falls back to 512-path chunks *if that first call returns an error*:
+For every input file, every buildinfo file, and every `package.json` ancestor across
+*all* projects, it calls `watchmanager.IsDirCoveredByWatch`, which linearly scans the
+entire desired-dirs map:
 
 ```go
-// fsevents_darwin.go
-const fseventsPathsPerStream = 512   // line 225
-
-func startFSEventsStreams(...) (...) {
-    ...
-    stream, err := startStream(paths, watches)   // ALL paths, unbounded (line 263)
-    if err == nil {
-        return []*fseventsStream{stream}, nil     // taken in production
-    }
-    // chunk into fseventsPathsPerStream streams -- only reached on error
-    ...
+// watchmanager.go
+func IsDirCoveredByWatch(dirs map[string]bool, dir string, opts) bool {
+    for wdir, recursive := range dirs { /* ContainsPath / ComparePaths */ }  // scans ALL
 }
 ```
 
-512 matches the 500-works / 600-fails cliff exactly. The code knows a stream can't hold
-more than 512 paths, but gates the chunking behind an error the real macOS API never
-returns: `fsEventStreamCreate` + `fsEventStreamStart` with >512 paths succeed and return
-a non-nil stream, so `err == nil`, the early return fires, and directories past the limit
-are silently never watched. No error, no rebuild.
+That makes the pass O(files × dirs). On the generated solution: 23,745 buildinfo files
+and ~1,534 desired dirs → **`computeDesiredWatches` takes ~85s** (measured; `Realpath`
+is only ~130ms of it, so the cost is the coverage scan, not I/O).
 
-The chunking fallback is only covered by `TestFSEventsSharedStreamFallsBackToChunks`,
-which *mocks* `startStream` to fail on the first call -- so the fallback is green in CI
-but dead code against the real FSEvents API.
+Consequences:
+1. `Start()` prints `Watching for file changes.` from the initial build report, then
+   calls `Watch()`, which sits in `computeDesiredWatches` for ~85s before registering a
+   single watch. Edits in that window are dropped (fsevents does not replay pre-arm
+   events).
+2. `DoCycle()` (the per-change handler) recomputes the whole desired-watch set again on
+   every change, so even once armed it is unusable at this scale.
 
-**Why `-b` only:** both watch modes use this fsevents backend, but plain `tsc --watch`
-coalesces `node_modules` into a few recursive ancestor watches and stays well under 512
-(handles 3000+ modules here). Build/solution mode registers one directory watch per
-resolved module location, so resolving more than ~512 `node_modules` packages exceeds
-the single-stream limit.
+Plain `tsc --watch` is the single-project watcher (`internal/execute/watcher.go`) and
+does not do this per-file × per-dir solution reconciliation.
 
-**Suggested fix:** chunk on count up front rather than waiting for an error that never
-comes -- if `len(paths) > fseventsPathsPerStream`, split into chunks immediately.
+## The check is only O(recursive) work
+
+Only wildcard (recursive) dirs can cover *other* dirs; every other entry is added
+non-recursive and only covers itself, which is an O(1) map lookup. Tracking the small
+recursive set (15 entries here) separately and using a map lookup for exact match takes
+`computeDesiredWatches` from **~85s to ~105ms** on this solution:
+
+```go
+recursiveDirs := []string{}            // maintained as recursive dirs are added
+covered := func(dir string) bool {
+    if _, has := desiredDirs[dir]; has { return true }   // exact match, O(1)
+    for _, wdir := range recursiveDirs {                 // only the recursive set
+        if tspath.ContainsPath(wdir, dir, opts) { return true }
+    }
+    return false
+}
+```
+
+(A production fix should key the coverage set on normalized/`ToPath` paths so the O(1)
+exact-match is `ComparePaths`-correct on case-insensitive filesystems; a raw string map
+misses case-variant duplicates the current scan folds together.)
+
+## Measure it yourself
+
+Add timing around the function and rebuild `tsgo`:
+
+```go
+// top of computeDesiredWatches
+start := time.Now()
+// before the return
+fmt.Fprintf(os.Stderr, "[watch] computeDesiredWatches took %v (%d dirs)\n",
+    time.Since(start), len(desiredDirs))
+```
