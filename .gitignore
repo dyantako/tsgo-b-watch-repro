@@ -4,3 +4,5 @@ dist/
 tsconfig.json
 *.tsbuildinfo
 *.log
+apps/
+packages/
