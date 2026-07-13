@@ -1,49 +1,31 @@
-# `tsc -b --watch` misses file changes on large solutions (native compiler)
+# `tsc -b --watch` is unusable on a large project-references / pnpm monorepo (native compiler)
 
-On a large project-references solution, the native compiler's build/solution watch
-(`tsc -b --watch`, i.e. `tsgo -b --watch`) prints `Watching for file changes.` almost
-immediately but then does not react to edits for a long time (tens of seconds to
-minutes). During that window every change is silently dropped. Plain `tsc --watch`
-(single project) is unaffected.
+On a large `tsc -b --watch` (native compiler / `tsgo`) solution there are two separate
+problems. The first is reproduced deterministically by the setup in this repo; the second
+was observed on a real ~36-project pnpm monorepo and is described with its debug-log
+signature (the minimal setup here does not reproduce it).
 
-Root cause: `computeDesiredWatches` in `internal/execute/build/orchestrator.go` is
-O(files × dirs) and takes ~85s on the solution generated below (and ~74s on a real
-30-project monorepo subgraph) before any filesystem watch is registered.
+Plain `tsc --watch` (single project, no `-b`) is not affected by either.
 
 ## Environment
 
 - `typescript@7.0.2` (also reproduces on the `7.1.0-dev` nightly)
-- macOS (arm64), Node 24. The `tsc` bin execs the platform `tsgo` binary, so
-  `tsc -b --watch` and `tsgo -b --watch` are the same native code.
+- macOS (arm64), Node 24. `tsc` execs the platform `tsgo` binary, so `tsc -b --watch`
+  and `tsgo -b --watch` are the same native code.
 
-## Reproduce
+---
 
-```sh
-npm install
-npm run setup      # generates 15 projects x 1500 shared node_modules packages
-npm run watch      # tsc -b --watch --preserveWatchOutput
-```
+## Problem 1: `computeDesiredWatches` is O(files × dirs) — the watch takes tens of seconds to a couple of minutes to arm
 
-You will see `Found 0 errors. Watching for file changes.` within a couple of seconds,
-but the process then pegs a CPU core for ~85s inside `computeDesiredWatches` before any
-watch exists. An edit made during that window is lost:
+`Found 0 errors. Watching for file changes.` prints within a couple of seconds, but no
+filesystem watch is actually registered until `computeDesiredWatches`
+(`internal/execute/build/orchestrator.go`) returns, which is O(total input + buildinfo
+files × number of desired watch dirs). Any edit made during that window is silently lost
+(fsevents does not replay pre-arm events).
 
-```sh
-# a few seconds after "Watching for file changes" prints:
-printf 'export const marker0: number = "boom";\n' >> projects/p0/src/index.ts
-```
-
-Expected: `File change detected` + a `TS2322` error. Actual: nothing, because no watch
-is registered yet. (A single small project returns from `computeDesiredWatches` in
-milliseconds and works fine, which is why the bug only shows at solution scale.)
-
-## Root cause
-
-`internal/execute/build/orchestrator.go`, `computeDesiredWatches()`.
-
-For every input file, every buildinfo file, and every `package.json` ancestor across
-*all* projects, it calls `watchmanager.IsDirCoveredByWatch`, which linearly scans the
-entire desired-dirs map:
+`computeDesiredWatches` calls `watchmanager.IsDirCoveredByWatch` for every input file,
+every buildinfo file, and every `package.json` ancestor across all projects, and that
+helper linearly scans the entire desired-dirs map:
 
 ```go
 // watchmanager.go
@@ -52,51 +34,66 @@ func IsDirCoveredByWatch(dirs map[string]bool, dir string, opts) bool {
 }
 ```
 
-That makes the pass O(files × dirs). On the generated solution: 23,745 buildinfo files
-and ~1,534 desired dirs → **`computeDesiredWatches` takes ~85s** (measured; `Realpath`
-is only ~130ms of it, so the cost is the coverage scan, not I/O).
+### Reproduce
 
-Consequences:
-1. `Start()` prints `Watching for file changes.` from the initial build report, then
-   calls `Watch()`, which sits in `computeDesiredWatches` for ~85s before registering a
-   single watch. Edits in that window are dropped (fsevents does not replay pre-arm
-   events).
-2. `DoCycle()` (the per-change handler) recomputes the whole desired-watch set again on
-   every change, so even once armed it is unusable at this scale.
-
-Plain `tsc --watch` is the single-project watcher (`internal/execute/watcher.go`) and
-does not do this per-file × per-dir solution reconciliation.
-
-## The check is only O(recursive) work
-
-Only wildcard (recursive) dirs can cover *other* dirs; every other entry is added
-non-recursive and only covers itself, which is an O(1) map lookup. Tracking the small
-recursive set (15 entries here) separately and using a map lookup for exact match takes
-`computeDesiredWatches` from **~85s to ~105ms** on this solution:
-
-```go
-recursiveDirs := []string{}            // maintained as recursive dirs are added
-covered := func(dir string) bool {
-    if _, has := desiredDirs[dir]; has { return true }   // exact match, O(1)
-    for _, wdir := range recursiveDirs {                 // only the recursive set
-        if tspath.ContainsPath(wdir, dir, opts) { return true }
-    }
-    return false
-}
+```sh
+npm install
+npm run setup      # 15 projects x 1500 shared node_modules packages
+npm run watch      # tsc -b --watch --preserveWatchOutput
 ```
 
-(A production fix should key the coverage set on normalized/`ToPath` paths so the O(1)
-exact-match is `ComparePaths`-correct on case-insensitive filesystems; a raw string map
-misses case-variant duplicates the current scan folds together.)
+`Watching for file changes.` prints within ~2s, then the process pegs a CPU core inside
+`computeDesiredWatches` before any watch exists. On this solution that is **~85s**
+(23,745 buildinfo files × ~1,534 desired dirs; `Realpath` is only ~130ms of it, so the
+cost is the coverage scan, not I/O). On the real monorepo it was ~74s for a 30-project
+subgraph and longer for the full 36-project graph.
 
-## Measure it yourself
+You can confirm nothing is watched yet: after `Watching for file changes.` prints, edit a
+file within the first minute and nothing happens; edit again after the CPU drops to idle
+and it is picked up in ~1s.
 
-Add timing around the function and rebuild `tsgo`:
+A single small project returns from `computeDesiredWatches` in milliseconds and works
+fine, which is why this only appears at solution scale.
 
-```go
-// top of computeDesiredWatches
-start := time.Now()
-// before the return
-fmt.Fprintf(os.Stderr, "[watch] computeDesiredWatches took %v (%d dirs)\n",
-    time.Since(start), len(desiredDirs))
+---
+
+## Problem 2 (observed on the real monorepo): once the watch arms, an fsevents overflow forces a continuous full-rebuild loop
+
+On the real monorepo, once the watch is actually live, a single save triggers one
+legitimate rebuild followed by an endless series of full rebuilds a few seconds apart,
+each driven by a filesystem-watch overflow rather than any file event.
+
+With `TS_WATCH_DEBUG=1` the loop is a flood of:
+
 ```
+[watch] resolved …/node_modules/~/areas/infrastructure/components/…/Server-Healthy-Ssh.svg to ancestor …/node_modules
+[watch] resolved …/apps/portal/node_modules/@types/…/AuditStream to ancestor …/apps/portal/node_modules/@types
+…
+[watch] event overflow, triggering rebuild
+[watch] event overflow, triggering rebuild
+[watch] event overflow, triggering rebuild
+```
+
+Failed module-resolution lookups — the portal's `~/*` path alias and asset imports
+(`.svg` / `.less` / `.png`) treated as package specifiers — resolve to their nearest
+existing ancestor, which is the `node_modules` / `.pnpm` tree, and that tree is watched.
+A tree that large makes macOS drop fsevents events (`ErrOverflow`), which `tsgo` turns
+into a forced full rebuild; the rebuild re-runs resolution and re-registers the same
+watches, producing another overflow, and so on.
+
+This is masked on stock `typescript@7.0.2` by Problem 1: the ~74–94s `computeDesiredWatches`
+stall means the watch is barely usable, so in normal use the loop is rarely reached (and
+when it is, each iteration is separated by another full `computeDesiredWatches` pass). It
+becomes obvious once the watch arms quickly.
+
+The minimal setup in this repo does **not** reproduce Problem 2: it needs failed-lookup
+imports (a path alias, asset imports) plus a `node_modules` tree large enough to overflow
+fsevents. It is included here only as an observation with its log signature.
+
+---
+
+## Net effect
+
+`tsc -b --watch` over the whole solution does not provide a working edit/rebuild loop on
+this monorepo: either it never arms in time (Problem 1) or, once it does, it rebuilds
+continuously (Problem 2). Plain `tsc --watch --noEmit` per project works.
