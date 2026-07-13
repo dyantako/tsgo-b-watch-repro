@@ -52,28 +52,3 @@ On the generated solution: 23,745 buildinfo files × ~1,534 desired dirs. `Realp
 Timing `computeDesiredWatches` (start/return) shows the full duration; the watch is
 registered (`ReconcileWatches`) only after it returns, which is why the process is idle to
 the user yet the watch is dead until then.
-
----
-
-### A second issue seen once the watch is armed
-
-On a large solution with many failed module-resolution lookups (for example a tsconfig
-`paths` alias, or importing non-code assets such as `.svg` / `.less` / `.png` as if they
-were modules), the failed lookups fall back to watching their nearest existing ancestor —
-often the whole `node_modules` tree, recursively. A tree that large can make the OS drop
-filesystem events (`ErrOverflow`), which the compiler turns into a forced full rebuild;
-the rebuild re-runs resolution and re-registers the same watches, overflowing again, so
-once the watch is armed a single save can trigger an endless series of full rebuilds a few
-seconds apart:
-
-```
-[watch] resolved <dir>/node_modules/<failed-lookup> to ancestor <dir>/node_modules
-… (many)
-[watch] event overflow, triggering rebuild
-[watch] event overflow, triggering rebuild
-[watch] event overflow, triggering rebuild
-```
-
-The minimal setup here does not reproduce this second issue — it needs failed-lookup
-imports plus a `node_modules` tree large enough to overflow the OS watcher — so it is noted
-only as an observation.
