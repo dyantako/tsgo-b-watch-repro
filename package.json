@@ -1,0 +1,13 @@
+{
+  "name": "tsgo-b-watch-repro",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "setup": "node setup.mjs",
+    "watch": "tsc -b --watch --preserveWatchOutput"
+  },
+  "dependencies": {
+    "typescript": "^7.0.2"
+  }
+}
